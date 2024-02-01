@@ -305,6 +305,7 @@ class TrainingPlan(TunableMixin, pl.LightningModule):
         n_obs_minibatch = loss_output.n_obs_minibatch
         kl_local = loss_output.kl_local_sum
         kl_global = loss_output.kl_global_sum
+        mmd_loss = loss_output.mmd_loss_sum
 
         # Use the torchmetric object for the ELBO
         # We only need to update the ELBO metric
@@ -323,6 +324,15 @@ class TrainingPlan(TunableMixin, pl.LightningModule):
             batch_size=n_obs_minibatch,
             sync_dist=self.use_sync_dist,
         )
+        if mmd_loss is not None:
+            self.log(
+                f"mmd_loss_{mode}",
+                mmd_loss,
+                on_step=False,
+                on_epoch=True,
+                sync_dist=self.use_sync_dist,
+            )
+
 
         # accumlate extra metrics passed to loss recorder
         for key in loss_output.extra_metrics_keys:

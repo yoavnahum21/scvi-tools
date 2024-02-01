@@ -3,6 +3,7 @@ from typing import List, Literal, Optional
 
 import numpy as np
 from anndata import AnnData
+import torch
 
 from scvi import REGISTRY_KEYS
 from scvi._types import MinifiedDataType
@@ -103,6 +104,7 @@ class SCVI(
         n_hidden: int = 128,
         n_latent: int = 10,
         n_layers: int = 1,
+        n_batches: int = 5,
         dropout_rate: float = 0.1,
         dispersion: Literal["gene", "gene-batch", "gene-label", "gene-cell"] = "gene",
         gene_likelihood: Literal["zinb", "nb", "poisson"] = "zinb",
@@ -127,7 +129,9 @@ class SCVI(
             library_log_means, library_log_vars = _init_library_size(
                 self.adata_manager, n_batch
             )
-
+        self.batches = []
+        for i in range(n_batches):
+            self.batches.append(torch.tensor(adata.X[adata.obs['_scvi_batch'] == i]))
         self.module = self._module_cls(
             n_input=self.summary_stats.n_vars,
             n_batch=n_batch,
@@ -137,6 +141,7 @@ class SCVI(
             n_hidden=n_hidden,
             n_latent=n_latent,
             n_layers=n_layers,
+            batches= self.batches,
             dropout_rate=dropout_rate,
             dispersion=dispersion,
             gene_likelihood=gene_likelihood,
@@ -161,8 +166,12 @@ class SCVI(
         )
         self.init_params_ = self._get_init_params(locals())
 
+
+
     @classmethod
     @setup_anndata_dsp.dedent
+
+
     def setup_anndata(
         cls,
         adata: AnnData,

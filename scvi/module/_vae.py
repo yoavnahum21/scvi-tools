@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from torch import logsumexp
 from torch.distributions import Normal
 from torch.distributions import kl_divergence as kl
+from torch import Tensor
 
 from scvi import REGISTRY_KEYS
 from scvi.autotune._types import Tunable
@@ -100,6 +101,9 @@ class VAE(BaseMinifiedModeModuleClass):
         n_input: int,
         n_batch: int = 0,
         n_labels: int = 0,
+        mode: str = "fast",
+        batches: torch.tensor = None,
+        beta: Tunable[float] = 10.0,
         n_hidden: Tunable[int] = 128,
         n_latent: Tunable[int] = 10,
         n_layers: Tunable[int] = 1,
@@ -108,7 +112,7 @@ class VAE(BaseMinifiedModeModuleClass):
         dropout_rate: Tunable[float] = 0.1,
         dispersion: Tunable[
             Literal["gene", "gene-batch", "gene-label", "gene-cell"]
-        ] = "gene",
+        ] = "gene-batch",
         log_variational: Tunable[bool] = True,
         gene_likelihood: Tunable[Literal["zinb", "nb", "poisson"]] = "zinb",
         latent_distribution: Tunable[Literal["normal", "ln"]] = "normal",
@@ -131,10 +135,15 @@ class VAE(BaseMinifiedModeModuleClass):
         self.gene_likelihood = gene_likelihood
         # Automatically deactivate if useless
         self.n_batch = n_batch
+        self.batches = batches
         self.n_labels = n_labels
+        self.beta = beta
+        self.mode = mode
+        self.epoch = 0
+        self.error = []
+        self.mmdloss = 0
         self.latent_distribution = latent_distribution
         self.encode_covariates = encode_covariates
-
         self.use_size_factor_key = use_size_factor_key
         self.use_observed_lib_size = use_size_factor_key or use_observed_lib_size
         if not self.use_observed_lib_size:
@@ -222,6 +231,55 @@ class VAE(BaseMinifiedModeModuleClass):
             scale_activation="softplus" if use_size_factor_key else "softmax",
             **_extra_decoder_kwargs,
         )
+
+    def _compute_mmd(self, z1: torch.Tensor, z2: torch.Tensor, gamma):
+
+        n = z1.shape[0]
+        m = z2.shape[0]
+
+        # calculate the RBF kernel between x and y
+        xx, yy, zz = torch.mm(z1, z1.t()), torch.mm(z2, z2.t()), torch.mm(z1, z2.t())
+        rx = (xx.diag().unsqueeze(0).expand_as(xx))
+        ry = (yy.diag().unsqueeze(0).expand_as(yy))
+        K = torch.exp(- 1 / gamma ** 2 * (rx.t() + rx - 2 * xx))
+        L = torch.exp(- 1 / gamma ** 2 * (ry.t() + ry - 2 * yy))
+        P = torch.exp(- 1 / gamma ** 2 * (rx.t() + ry - 2 * zz))
+
+        # calculate the MMD
+        mmd = 1 / (n ** 2) * torch.sum(K) + 1 / (m ** 2) * torch.sum(L) - 2 / (n * m) * torch.sum(P)
+        return mmd
+
+    def _compute_fast_mmd(self, z1: torch.Tensor, z2: torch.Tensor):
+        m2 = min(z1.shape[0], z2.shape[0]) // 2
+        if z1.shape[0] > z2.shape[0]:
+            z1 = z1[0:2 * m2]
+        else:
+            z2 = z2[0:2 * m2]
+        T1 = z1[:-1:2]
+        T2 = z1[:-1:2]
+        S1 = z2[:-1:2]
+        S2 = z2[1::2]
+        P = (T1 - T2).float()
+        Q = (S1 - S2).float()
+        R = (T1 - S2).float()
+        W = (T2 - S1).float()
+        fast_mmd = torch.exp(-torch.norm(P, dim=1)).sum() + torch.exp(-torch.norm(Q, dim=1)).sum() + torch.exp(
+            -torch.norm(R, dim=1)).sum() + torch.exp(-torch.norm(W, dim=1)).sum()
+        return fast_mmd
+
+
+    def _compute_mmd_loss(self, batches: Tensor, mode: str) -> Tensor:
+        mmd_Loss = 0.0
+        for i in range(len(batches)):
+            for j in range(i):
+                if mode == "normal":
+                    mmd_Loss += self._compute_mmd(batches[j], batches[i])
+                elif mode == "fast":
+                    mmd_Loss += self._compute_fast_mmd(batches[j], batches[i])
+                else:
+                    raise ValueError
+        return torch.tensor(mmd_Loss)
+
 
     def _get_inference_input(
         self,
@@ -480,17 +538,16 @@ class VAE(BaseMinifiedModeModuleClass):
         kl_local_no_warmup = kl_divergence_l
 
         weighted_kl_local = kl_weight * kl_local_for_warmup + kl_local_no_warmup
-
-        loss = torch.mean(reconst_loss + weighted_kl_local)
+        self.mmdloss = self._compute_mmd_loss(self.batches, self.mode)
+        loss = torch.mean(reconst_loss + weighted_kl_local) + self.beta * self.mmdloss
 
         kl_local = {
             "kl_divergence_l": kl_divergence_l,
             "kl_divergence_z": kl_divergence_z,
         }
         return LossOutput(
-            loss=loss, reconstruction_loss=reconst_loss, kl_local=kl_local
+            loss=loss, reconstruction_loss=reconst_loss, kl_local=kl_local, mmd_loss=self.mmdloss
         )
-
     @torch.inference_mode()
     def sample(
         self,
@@ -754,3 +811,7 @@ class LDVAE(VAE):
             loadings = loadings[:, : -self.n_batch]
 
         return loadings
+
+
+
+
